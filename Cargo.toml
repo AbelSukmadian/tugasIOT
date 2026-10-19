@@ -36,3 +36,8 @@ embuild = "0.33"
 
 [package.metadata.espflash]
 partition_table = "partitions.csv"
+
+[package.metadata.esp-idf-sys]
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = ["components/model"]

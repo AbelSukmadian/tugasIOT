@@ -34,7 +34,9 @@ pub fn perform_ota_update(download_url: &str) -> anyhow::Result<()> {
     }
 
     // 4. Read and Write chunks
-    let mut buf = [0u8; 4096];
+    // Gunakan Box<[u8]> agar buffer ada di heap, bukan stack,
+    // supaya tidak menyebabkan stack overflow saat OTA berlangsung.
+    let mut buf = vec![0u8; 4096].into_boxed_slice();
     let mut total_read = 0;
 
     loop {

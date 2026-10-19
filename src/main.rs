@@ -1,15 +1,14 @@
-mod ota;
+﻿mod ota;
 
-use dht_sensor::dht22;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::delay::{Ets, FreeRtos};
-use esp_idf_svc::hal::gpio::{PinDriver, Pull};
+use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::gpio::{Level, PinDriver};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::mqtt::client::{EspMqttClient, EventPayload, MqttClientConfiguration, QoS};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::mpsc;
 use std::thread;
 
@@ -19,17 +18,7 @@ const MQTT_URL: &str = "mqtt://iotrust.duckdns.org:1883";
 const MQTT_USER: &str = "esp32_device";
 const MQTT_PASS: &str = "Sukmadian1525";
 const DEVICE_ID: &str = "ESP32-S3-01";
-const FW_VERSION: &str = "0.3.0";
-
-#[derive(Serialize)]
-struct Telemetry<'a> {
-    device_id: &'a str,
-    confidence: f32,        // dummy sampai TinyML terpasang
-    inference_time_ms: i32, // dummy
-    ram_usage_kb: i32,      // dummy
-    temperature: f32,       // asli dari DHT22 (backend belum menyimpannya)
-    humidity: f32,          // asli dari DHT22
-}
+const FW_VERSION: &str = "0.10.0"; // naikan versi untuk test OTA
 
 #[derive(Deserialize)]
 struct OtaCommand {
@@ -45,15 +34,15 @@ enum Msg {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    info!("Firmware v{} mulai", FW_VERSION);
+    info!("=== Firmware v{} (LED Blink Dummy) mulai ===", FW_VERSION);
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
-    // ---- DHT22 ----
-    let mut dht_pin = PinDriver::input_output_od(peripherals.pins.gpio10, Pull::Up)?;
-    dht_pin.set_high()?;
+    // ---- LED Internal (GPIO48) ----
+    let mut led = PinDriver::output(peripherals.pins.gpio48)?;
+    info!("LED internal siap di GPIO48");
 
     // ---- Wi-Fi ----
     let mut wifi = Box::new(EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?);
@@ -72,8 +61,10 @@ fn main() -> anyhow::Result<()> {
     info!("Wi-Fi terhubung");
 
     // ---- MQTT ----
-    let telemetry_topic = format!("esp32/{}/telemetry", DEVICE_ID);
     let ota_topic = format!("esp32/{}/ota/command", DEVICE_ID);
+    let status_topic = format!("esp32/{}/status", DEVICE_ID);
+    let ota_topic_thread = ota_topic.clone();
+    let (tx, rx) = mpsc::channel::<Msg>();
 
     let conf = MqttClientConfiguration {
         client_id: Some(DEVICE_ID),
@@ -83,17 +74,24 @@ fn main() -> anyhow::Result<()> {
     };
     let (mut client, mut conn) = EspMqttClient::new(MQTT_URL, &conf)?;
 
-    // Thread khusus membaca event MQTT, hasilnya dikirim ke loop utama lewat channel
-    let (tx, rx) = mpsc::channel::<Msg>();
-    thread::Builder::new().stack_size(6144).spawn(move || {
+    // Thread MQTT event reader
+    thread::Builder::new().stack_size(12288).spawn(move || {
         while let Ok(event) = conn.next() {
             match event.payload() {
                 EventPayload::Connected(_) => {
                     let _ = tx.send(Msg::Connected);
                 }
-                EventPayload::Received { data, .. } => {
-                    if let Ok(cmd) = serde_json::from_slice::<OtaCommand>(data) {
-                        let _ = tx.send(Msg::Ota(cmd));
+                EventPayload::Received { topic, data, .. } => {
+                    let raw_msg = std::str::from_utf8(data).unwrap_or("invalid utf8");
+                    log::info!("Pesan MQTT Masuk! Topic: {:?} | Data: {}", topic, raw_msg);
+
+                    match serde_json::from_slice::<OtaCommand>(data) {
+                        Ok(cmd) => {
+                            let _ = tx.send(Msg::Ota(cmd));
+                        }
+                        Err(e) => {
+                            log::error!("Gagal parsing JSON OTA: {:?}", e);
+                        }
                     }
                 }
                 EventPayload::Disconnected => warn!("MQTT terputus"),
@@ -102,9 +100,12 @@ fn main() -> anyhow::Result<()> {
         }
     })?;
 
-    // ---- Loop utama ----
+    // ---- Loop utama: LED Blink + OTA listener ----
+    let mut led_state = false;
+    let mut tick: u32 = 0;
+
     loop {
-        // 1. Proses pesan dari thread MQTT
+        // 1. Proses pesan MQTT
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::Connected => {
@@ -112,46 +113,51 @@ fn main() -> anyhow::Result<()> {
                     if let Err(e) = client.subscribe(&ota_topic, QoS::AtLeastOnce) {
                         warn!("Subscribe gagal: {:?}", e);
                     }
+                    let payload = format!(
+                        r#"{{"device_id":"{}","fw":"{}","status":"online"}}"#,
+                        DEVICE_ID, FW_VERSION
+                    );
+                    let _ = client.publish(
+                        &status_topic,
+                        QoS::AtLeastOnce,
+                        false,
+                        payload.as_bytes(),
+                    );
                 }
                 Msg::Ota(cmd) => {
                     if cmd.version == FW_VERSION {
-                        info!("Command OTA versi {} sama dengan yang berjalan, diabaikan", cmd.version);
+                        info!("OTA diabaikan: versi {} sudah berjalan", cmd.version);
                     } else {
-                        info!("Command OTA: versi {} dari {}", cmd.version, cmd.url);
-                        if let Err(e) = ota::perform_ota_update(&cmd.url) {
-                            error!("OTA gagal: {}", e);
+                        info!("OTA diterima: v{} dari {}", cmd.version, cmd.url);
+                        // Jalankan OTA di dedicated thread dengan stack besar
+                        // untuk menghindari stack overflow (HTTP + buffer + OTA state)
+                        let url = cmd.url.clone();
+                        if let Err(e) = thread::Builder::new()
+                            .stack_size(65536) // 64KB: cukup untuk HTTP client + OTA buffers
+                            .spawn(move || {
+                                if let Err(e) = ota::perform_ota_update(&url) {
+                                    error!("OTA gagal: {}", e);
+                                }
+                            })
+                        {
+                            error!("Gagal spawn OTA thread: {}", e);
                         }
                     }
                 }
             }
         }
 
-        // 2. Baca DHT22
-        let mut delay = Ets;
-        let (temp, hum) = match dht22::blocking::read(&mut delay, &mut dht_pin) {
-            Ok(r) => (r.temperature, r.relative_humidity),
-            Err(e) => {
-                warn!("DHT22 gagal: {:?}", e);
-                FreeRtos::delay_ms(2000);
-                continue;
-            }
-        };
+        // 2. Toggle LED setiap 500ms
+        led_state = !led_state;
+        led.set_level(if led_state { Level::High } else { Level::Low })?;
+        info!(
+            "[tick {}] LED {} | FW v{}",
+            tick,
+            if led_state { "ON " } else { "OFF" },
+            FW_VERSION
+        );
+        tick += 1;
 
-        // 3. Publish telemetry
-        let t = Telemetry {
-            device_id: DEVICE_ID,
-            confidence: 92.5,
-            inference_time_ms: 25,
-            ram_usage_kb: 140,
-            temperature: temp,
-            humidity: hum,
-        };
-        let payload = serde_json::to_vec(&t)?;
-        match client.publish(&telemetry_topic, QoS::AtLeastOnce, false, &payload) {
-            Ok(_) => info!("Terkirim: {:.1} C, {:.1} %", temp, hum),
-            Err(e) => warn!("Publish gagal: {:?}", e),
-        }
-
-        FreeRtos::delay_ms(5000);
+        FreeRtos::delay_ms(1000);
     }
 }
